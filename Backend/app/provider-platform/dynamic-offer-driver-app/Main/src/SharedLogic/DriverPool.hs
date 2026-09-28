@@ -133,6 +133,7 @@ import Lib.ConfigPilot.Interface.Types (getOneConfig)
 import Lib.Finance.Storage.Beam.BeamFlow (BeamFlow)
 import qualified Lib.Types.SpecialLocation as SL
 import qualified SharedLogic.Beckn.Common as DST
+import qualified SharedLogic.DriverFatigue as DriverFatigue
 import SharedLogic.DriverPool.DriverPoolData (mkParallelSearchRequestKey)
 import qualified SharedLogic.DriverPool.DriverPoolData as DPD
 import qualified SharedLogic.DriverPool.DriverPoolDataBuilder as DPDBuilder
@@ -1231,7 +1232,8 @@ calculateDriverPoolWithActualDist CalculateDriverPoolReq {..} poolType currentSe
             if null chunkPrevAttemptedIds
               then pure chunkResults
               else filterPrevAttemptedByRequestCount chunkPrevAttemptedIds chunkResults
-          let (chunkOnRide, chunkOffRide) = partition (.onRide) rateLimited
+          rested <- DriverFatigue.filterOutFatiguedDrivers (.driverId) rateLimited
+          let (chunkOnRide, chunkOffRide) = partition (.onRide) rested
               chunkOnRideAsPool = makeDriverPoolResult <$> chunkOnRide
           processedOffRide <- runOffRideStages chunkOffRide
           chunkLoop ltsReq fetchPoolData rest (offRideAcc <> processedOffRide) (onRideAcc <> chunkOnRideAsPool)
