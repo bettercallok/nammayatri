@@ -786,7 +786,7 @@ endRideHandler handle@ServiceHandle {..} rideId req = do
     -- Count the ride toward driver fatigue only once the end-ride transaction has committed, so a
     -- failed (and later retried) end ride is never counted.
     case endRideTransactionRes of
-      Right _ -> fork "driverFatigue:recordCompletedRide" $ DriverFatigue.recordCompletedRide driverId rideDurationSeconds
+      Right _ -> fork "driverFatigue:recordCompletedRide" $ DriverFatigue.recordCompletedRide thresholdConfig.timeDiffFromUtc driverId updRide'.tripStartTime now rideDurationSeconds
       Left err -> logError $ "driverFatigue: skipping recordCompletedRide, endRideTransaction failed: " <> show err
 
     fork "Push End Ride Metric" $ incrementRideEndCounter "endRide"

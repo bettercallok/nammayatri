@@ -1232,7 +1232,7 @@ calculateDriverPoolWithActualDist CalculateDriverPoolReq {..} poolType currentSe
             if null chunkPrevAttemptedIds
               then pure chunkResults
               else filterPrevAttemptedByRequestCount chunkPrevAttemptedIds chunkResults
-          rested <- DriverFatigue.filterOutFatiguedDrivers (.driverId) rateLimited
+          rested <- DriverFatigue.filterOutFatiguedDrivers transporterConfig.timeDiffFromUtc merchantOperatingCityId (.driverId) rateLimited
           let (chunkOnRide, chunkOffRide) = partition (.onRide) rested
               chunkOnRideAsPool = makeDriverPoolResult <$> chunkOnRide
           processedOffRide <- runOffRideStages chunkOffRide
