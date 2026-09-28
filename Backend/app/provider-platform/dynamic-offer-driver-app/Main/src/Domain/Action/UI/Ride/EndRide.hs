@@ -101,6 +101,7 @@ import qualified Lib.Yudhishthira.Tools.DebugLog as LYDL
 import qualified Lib.Yudhishthira.Types as LYT
 import qualified SharedLogic.CallBAP as CallBAP
 import qualified SharedLogic.CallBAPInternal as CallBAPInternal
+import qualified SharedLogic.DriverFatigue as DriverFatigue
 import qualified SharedLogic.External.LocationTrackingService.Flow as LF
 import qualified SharedLogic.External.LocationTrackingService.Types as LT
 import qualified SharedLogic.FareCalculator as Fare
@@ -661,6 +662,7 @@ endRideHandler handle@ServiceHandle {..} rideId req = do
     newRideTags <- withTryCatch "computeNammaTags:RideEnd" (LYDL.computeNammaTagsWithDebugLog LYDL.Driver (cast booking.merchantOperatingCityId) LYT.RideEnd (Just booking.transactionId) (Y.EndRideTagData updRide' booking isDriverSameAsCustomer shouldBlockCoinsForSameRiderFlow rideDurationSeconds))
     let updRide = updRide' {DRide.rideTags = ride.rideTags <> eitherToMaybe newRideTags}
     QRide.incrementDriverRiderRideCountForDay (cast driverId) booking.riderId
+    fork "driverFatigue:recordCompletedRide" $ DriverFatigue.recordCompletedRide driverId rideDurationSeconds
     when (thresholdConfig.enableMobilityBilling == Just True) $
       fork "report Google mobility billable event" $
         GoogleMobilityBilling.reportNavBillableEvent booking updRide
