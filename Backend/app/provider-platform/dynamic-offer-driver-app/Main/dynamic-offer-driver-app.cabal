@@ -620,6 +620,7 @@ library
       SharedLogic.DashboardAlert
       SharedLogic.DeleteDriver
       SharedLogic.DriverCancellationPenalty
+      SharedLogic.DriverFatigue
       SharedLogic.DriverFee
       SharedLogic.DriverFleetOperatorAssociation
       SharedLogic.DriverFlowStatus
