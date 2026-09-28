@@ -662,7 +662,6 @@ endRideHandler handle@ServiceHandle {..} rideId req = do
     newRideTags <- withTryCatch "computeNammaTags:RideEnd" (LYDL.computeNammaTagsWithDebugLog LYDL.Driver (cast booking.merchantOperatingCityId) LYT.RideEnd (Just booking.transactionId) (Y.EndRideTagData updRide' booking isDriverSameAsCustomer shouldBlockCoinsForSameRiderFlow rideDurationSeconds))
     let updRide = updRide' {DRide.rideTags = ride.rideTags <> eitherToMaybe newRideTags}
     QRide.incrementDriverRiderRideCountForDay (cast driverId) booking.riderId
-    fork "driverFatigue:recordCompletedRide" $ DriverFatigue.recordCompletedRide driverId rideDurationSeconds
     when (thresholdConfig.enableMobilityBilling == Just True) $
       fork "report Google mobility billable event" $
         GoogleMobilityBilling.reportNavBillableEvent booking updRide
@@ -782,7 +781,13 @@ endRideHandler handle@ServiceHandle {..} rideId req = do
           sendDashboardSms requestor.merchantId booking.merchantOperatingCityId Sms.ENDRIDE (Just ride) driverId (Just booking) finalFare
         _ -> pure ()
 
-    awaitAll [clearEditDestinationWayAndSnappedPointsFork, endRideTransactionFork, clearInterpolatedPointsFork, notifyCompleteToBAPFork, clearReachedStopLocationsFork]
+    endRideTransactionRes <- L.await Nothing endRideTransactionFork
+    awaitAll [clearEditDestinationWayAndSnappedPointsFork, clearInterpolatedPointsFork, notifyCompleteToBAPFork, clearReachedStopLocationsFork]
+    -- Count the ride toward driver fatigue only once the end-ride transaction has committed, so a
+    -- failed (and later retried) end ride is never counted.
+    case endRideTransactionRes of
+      Right _ -> fork "driverFatigue:recordCompletedRide" $ DriverFatigue.recordCompletedRide driverId rideDurationSeconds
+      Left err -> logError $ "driverFatigue: skipping recordCompletedRide, endRideTransaction failed: " <> show err
 
     fork "Push End Ride Metric" $ incrementRideEndCounter "endRide"
 
