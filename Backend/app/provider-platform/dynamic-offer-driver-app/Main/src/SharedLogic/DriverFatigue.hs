@@ -25,8 +25,14 @@ module SharedLogic.DriverFatigue
     currentScore,
     dailyDrivingMinutesAt,
 
-    -- * Level
-    isBlockedAt,
+    -- * Levels (JSON Logic)
+    FatigueLevel (..),
+    FatigueDecision (..),
+    FatigueRuleInput (..),
+    mkRuleInput,
+    defaultFatigueRule,
+    fetchFatigueRules,
+    evaluateFatigueLevel,
 
     -- * Redis-backed API
     FatigueStatus (..),
@@ -38,6 +44,7 @@ module SharedLogic.DriverFatigue
   )
 where
 
+import qualified Data.Aeson as A
 import Data.List (partition)
 import qualified Data.Map.Strict as Map
 import Data.Time (Day, UTCTime (..), utctDay)
@@ -46,6 +53,7 @@ import Kernel.Prelude
 import qualified Kernel.Storage.Hedis as Redis
 import Kernel.Types.Id
 import Kernel.Utils.Common
+import Lib.Yudhishthira.Tools.Utils (runLogics)
 
 -- Per-driver FATIGUE GUARD with recovery by rest instead of a hard reset.
 --
@@ -60,8 +68,10 @@ import Kernel.Utils.Common
 -- window. A 30-40 min rest after a long shift therefore only partially recovers, while a long rest
 -- brings the score near zero. Daily driving does not decay; it resets per local day.
 --
--- Level: a driver is blocked while the score is at the continuous-driving limit, while today's
--- driving is at the daily cap, or while still recovering from a block (see isBlockedAt).
+-- Levels: NONE / WARN / BLOCK are decided by JSON Logic rules (Yudhishthira's runLogics) over the
+-- current score, daily minutes, time since the last ride etc. fetchFatigueRules is the single
+-- seam for per-city rules (a future DRIVER_FATIGUE LogicDomain); today it returns the default
+-- rule. A rule error is treated as NONE, so a bad rule can never block every driver.
 --
 -- All Redis calls go through withCrossAppRedis: rides end in the driver app while pooling runs in
 -- the allocator (and batch 1 inline in the driver app), and all of them must see the same key.
@@ -186,23 +196,102 @@ dailyDrivingMinutesAt tz now st
   | otherwise = 0
 
 ------------------------------------------------------------------------------------------------
--- Level (built-in limits)
+-- Levels (JSON Logic via Yudhishthira)
 ------------------------------------------------------------------------------------------------
 
-blockScoreMinutes, releaseScoreMinutes :: Double
-blockScoreMinutes = 240
-releaseScoreMinutes = 120
+data FatigueLevel = NONE | WARN | BLOCK
+  deriving (Generic, Show, Read, Eq, Ord, FromJSON, ToJSON)
 
--- | Blocked when the current score reaches 240 min-eq (~4 h of continuous day driving) or today's
--- driving reaches the daily cap. Hysteresis: once the last ride ended at >= 240, the driver stays
--- blocked until the score has halved to 120 (one half-life of rest); without it, a driver who
--- ended a ride at 250 would be unblocked after ~4 minutes.
-isBlockedAt :: FatigueConfig -> Seconds -> UTCTime -> FatigueState -> Bool
-isBlockedAt cfg tz now st =
-  let score = currentScore cfg now st
-   in score >= blockScoreMinutes
-        || dailyDrivingMinutesAt tz now st >= cfg.dailyCapMinutes
-        || (st.fatigueScore >= blockScoreMinutes && score >= releaseScoreMinutes)
+data FatigueDecision = FatigueDecision
+  { level :: FatigueLevel,
+    reason :: Text
+  }
+  deriving (Generic, Show, Eq, FromJSON, ToJSON)
+
+-- | What a fatigue rule sees.
+data FatigueRuleInput = FatigueRuleInput
+  { fatigueScoreMinutes :: Double,
+    -- | Undecayed score at the end of the last ride = the peak before the current rest.
+    scoreAtLastRideEndMinutes :: Double,
+    dailyDrivingMinutes :: Double,
+    dailyCapMinutes :: Double,
+    minutesSinceLastRide :: Double,
+    halfLifeMinutes :: Double,
+    localHour :: Int,
+    isNight :: Bool,
+    ridesToday :: Int
+  }
+  deriving (Generic, Show, Eq, FromJSON, ToJSON)
+
+mkRuleInput :: FatigueConfig -> Seconds -> UTCTime -> FatigueState -> FatigueRuleInput
+mkRuleInput cfg tz now st =
+  let hour = localHourOf tz now
+      sameDay = localDayOf tz now == st.dailyDrivingDay
+   in FatigueRuleInput
+        { fatigueScoreMinutes = currentScore cfg now st,
+          scoreAtLastRideEndMinutes = st.fatigueScore,
+          dailyDrivingMinutes = dailyDrivingMinutesAt tz now st,
+          dailyCapMinutes = cfg.dailyCapMinutes,
+          minutesSinceLastRide = max 0 (realToFrac (diffUTCTime now st.lastRideEndAt) / 60),
+          halfLifeMinutes = cfg.halfLifeMinutes,
+          localHour = hour,
+          isNight = isNightHour cfg hour,
+          ridesToday = if sameDay then st.ridesToday else 0
+        }
+
+-- | Default rule (JSON Logic), used when a city has no rules of its own:
+--
+--   * BLOCK when today's driving reaches the daily cap (does not recover by resting),
+--   * BLOCK when the score reaches 240 min-eq (~4 h of continuous day driving),
+--   * BLOCK while recovering from a block: the last ride ended at >= 240 and the score has not yet
+--     halved to 120, i.e. at least one half-life (~60 min at the default) of rest. Without this
+--     hysteresis a driver who ended a ride at 250 would be unblocked after ~4 minutes of rest,
+--   * WARN from 180 (~3 h),
+--   * otherwise NONE.
+--
+-- 4 h / 60 min is in line with common driving-hours rules (e.g. a 45 min break after 4.5 h of
+-- driving); a stricter city only needs a different rule, not a code change.
+--
+-- Written as nested 3-argument "if"s: the json-logic-hs engine behind runLogics does not accept the
+-- multi-branch form ("if": [c1, a, c2, b, ..., else]).
+defaultFatigueRule :: A.Value
+defaultFatigueRule =
+  ifThenElse
+    (A.object ["or" A..= [ge "dailyDrivingMinutes" (A.object ["var" A..= ("dailyCapMinutes" :: Text)]), ge "fatigueScoreMinutes" (A.Number 240)]])
+    (decision "BLOCK" "continuous or daily driving limit reached")
+    $ ifThenElse
+      (A.object ["and" A..= [ge "scoreAtLastRideEndMinutes" (A.Number 240), ge "fatigueScoreMinutes" (A.Number 120)]])
+      (decision "BLOCK" "recovering from a driving-limit block")
+      $ ifThenElse
+        (ge "fatigueScoreMinutes" (A.Number 180))
+        (decision "WARN" "approaching the continuous driving limit")
+        (decision "NONE" "rested")
+  where
+    ifThenElse :: A.Value -> A.Value -> A.Value -> A.Value
+    ifThenElse cond thenV elseV = A.object ["if" A..= [cond, thenV, elseV]]
+    ge :: Text -> A.Value -> A.Value
+    ge var threshold = A.object [">=" A..= [A.object ["var" A..= var], threshold]]
+    decision :: Text -> Text -> A.Value
+    decision lvl why = A.object ["level" A..= lvl, "reason" A..= why]
+
+-- | The single seam for per-city rules. Switching to a DRIVER_FATIGUE LogicDomain means fetching
+-- via Tools.DynamicLogic.getAppDynamicLogic here and falling back to the default when empty.
+fetchFatigueRules :: Applicative m => Id DMOC.MerchantOperatingCity -> UTCTime -> m [A.Value]
+fetchFatigueRules _merchantOpCityId _localTime = pure [defaultFatigueRule]
+
+-- | Runs the rules with Yudhishthira's engine. Any rule error, or an output that is not a
+-- {level, reason} object, is logged and treated as NONE.
+evaluateFatigueLevel :: (MonadFlow m) => [A.Value] -> FatigueRuleInput -> m FatigueDecision
+evaluateFatigueLevel rules input = do
+  resp <- runLogics rules input
+  case (resp.errors, A.fromJSON resp.result) of
+    ([], A.Success decision) -> pure decision
+    (errs, parsed) -> do
+      let why = case parsed of
+            A.Error parseErr -> ", unparseable output: " <> toText parseErr
+            A.Success _ -> ""
+      logError $ "DriverFatigue: fatigue rule failed, treating as NONE. errors=" <> show errs <> why
+      pure $ FatigueDecision NONE "rule error"
 
 ------------------------------------------------------------------------------------------------
 -- Redis-backed API
@@ -225,45 +314,69 @@ recordCompletedRide tz driverId mbStart end rideDurationSec = do
 data FatigueStatus = FatigueStatus
   { fatigueScoreMinutes :: Double,
     dailyDrivingMinutes :: Double,
-    blocked :: Bool,
-    -- | Estimated minutes of rest until unblocked (5-minute steps up to 24 h); Nothing if longer.
-    minutesUntilUnblocked :: Maybe Int
+    level :: FatigueLevel,
+    reason :: Text,
+    -- | Estimated minutes of rest until the level is NONE (re-running the rules on the projected
+    -- decay, in 5-minute steps up to 24 h); Nothing if it would take longer.
+    minutesUntilNone :: Maybe Int
   }
   deriving (Generic, Show, Eq, FromJSON, ToJSON)
 
-getFatigueStatus :: (Redis.HedisFlow m r) => Seconds -> Id DMOC.MerchantOperatingCity -> Id a -> m FatigueStatus
-getFatigueStatus tz _merchantOpCityId driverId = do
+decideAt :: (MonadFlow m) => [A.Value] -> Seconds -> UTCTime -> FatigueState -> m FatigueDecision
+decideAt rules tz now st = evaluateFatigueLevel rules (mkRuleInput defaultFatigueConfig tz now st)
+
+getFatigueStatus :: (MonadFlow m, Redis.HedisFlow m r) => Seconds -> Id DMOC.MerchantOperatingCity -> Id a -> m FatigueStatus
+getFatigueStatus tz merchantOpCityId driverId = do
   now <- getCurrentTime
-  getFatigueState driverId <&> \case
-    Nothing -> FatigueStatus 0 0 False (Just 0)
-    Just st ->
-      let blockedAt t = isBlockedAt defaultFatigueConfig tz t st
-       in FatigueStatus
-            { fatigueScoreMinutes = currentScore defaultFatigueConfig now st,
-              dailyDrivingMinutes = dailyDrivingMinutesAt tz now st,
-              blocked = blockedAt now,
-              minutesUntilUnblocked = (* 5) <$> find (\k -> not (blockedAt (addUTCTime (fromIntegral (k * 300)) now))) ([0 .. 24 * 12] :: [Int])
-            }
+  rules <- fetchFatigueRules merchantOpCityId (toLocal tz now)
+  getFatigueState driverId >>= \case
+    Nothing -> pure $ FatigueStatus 0 0 NONE "no recent rides" (Just 0)
+    Just st -> do
+      decision <- decideAt rules tz now st
+      let input = mkRuleInput defaultFatigueConfig tz now st
+          stepsOf5Min = [0 .. 24 * 12] :: [Int]
+      untilNone <-
+        if decision.level == NONE
+          then pure (Just 0)
+          else findM (\k -> (== NONE) . (.level) <$> decideAt rules tz (addUTCTime (fromIntegral (k * 300)) now) st) stepsOf5Min <&> fmap (* 5)
+      pure
+        FatigueStatus
+          { fatigueScoreMinutes = input.fatigueScoreMinutes,
+            dailyDrivingMinutes = input.dailyDrivingMinutes,
+            level = decision.level,
+            reason = decision.reason,
+            minutesUntilNone = untilNone
+          }
+  where
+    findM _ [] = pure Nothing
+    findM p (x : xs) = p x >>= \ok -> if ok then pure (Just x) else findM p xs
 
-isDriverFatigued :: (Redis.HedisFlow m r) => Seconds -> Id DMOC.MerchantOperatingCity -> Id a -> m Bool
-isDriverFatigued tz merchantOpCityId driverId = (.blocked) <$> getFatigueStatus tz merchantOpCityId driverId
+isDriverFatigued :: (MonadFlow m, Redis.HedisFlow m r) => Seconds -> Id DMOC.MerchantOperatingCity -> Id a -> m Bool
+isDriverFatigued tz merchantOpCityId driverId = (== BLOCK) . (.level) <$> getFatigueStatus tz merchantOpCityId driverId
 
--- | Drops blocked drivers from a pool chunk with a single pipelined MGET. Missing state and Redis
--- errors read as not blocked, so the guard fails open and never empties a pool on a Redis outage.
+-- | Drops BLOCK-level drivers from a pool chunk: one pipelined MGET for the whole chunk, then the
+-- rules are evaluated per driver in-process. WARN drivers are kept and logged (future: FCM nudge).
+-- Missing state, Redis errors and rule errors all read as NONE, so the guard fails open.
 filterOutFatiguedDrivers ::
-  (Redis.HedisFlow m r) =>
+  (MonadFlow m, Redis.HedisFlow m r) =>
   Seconds ->
   Id DMOC.MerchantOperatingCity ->
   (d -> Id b) ->
   [d] ->
   m [d]
 filterOutFatiguedDrivers _ _ _ [] = pure []
-filterOutFatiguedDrivers tz _merchantOpCityId getDriverId drivers = do
+filterOutFatiguedDrivers tz merchantOpCityId getDriverId drivers = do
   now <- getCurrentTime
   let keyFor d = mkFatigueStateKey (getDriverId d).getId
   statesByKey <- Map.fromList <$> Redis.withCrossAppRedis (Redis.mGetClusterWithKeys @FatigueState (map keyFor drivers))
-  let isBlocked d = maybe False (isBlockedAt defaultFatigueConfig tz now) (Map.lookup (keyFor d) statesByKey)
-      (blockedDrivers, kept) = partition isBlocked drivers
-  unless (null blockedDrivers) $
-    logInfo $ "DriverFatigue: filtered out " <> show (length blockedDrivers) <> " fatigued driver(s) from pool"
-  pure kept
+  rules <- fetchFatigueRules merchantOpCityId (toLocal tz now)
+  decided <- forM drivers $ \d -> case Map.lookup (keyFor d) statesByKey of
+    Nothing -> pure (d, NONE)
+    Just st -> (d,) . (.level) <$> decideAt rules tz now st
+  let (blocked, kept) = partition ((== BLOCK) . snd) decided
+      warned = filter ((== WARN) . snd) kept
+  unless (null blocked) $
+    logInfo $ "DriverFatigue: filtered out " <> show (length blocked) <> " fatigued driver(s) from pool"
+  unless (null warned) $
+    logInfo $ "DriverFatigue: " <> show (length warned) <> " driver(s) at WARN level kept in pool"
+  pure (map fst kept)
